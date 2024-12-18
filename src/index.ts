@@ -1,7 +1,9 @@
 import { Client, Conn, PacketMiddleware, packetAbilities, sendTo, SimplePositionTransformer } from "@icetank/mcproxy";
 import { createServer, ServerClient } from "minecraft-protocol";
 import type { Server } from "minecraft-protocol";
-import { FakeSpectator, FakePlayer, sendMessage, sleep, onceWithCleanup } from "./util";
+import { sendMessage, sleep, onceWithCleanup } from "./util";
+import { FakePlayer } from "./FakePlayer";
+import { FakeSpectator } from "./FakeSpectator";
 import { BotOptions } from "mineflayer";
 import EventEmitter, { once } from "events";
 import { setTimeout } from "timers/promises";
@@ -13,15 +15,26 @@ import { Vec3 } from 'vec3'
 
 export { sendMessage }
 
-type allowListCallback = (username: string) => boolean
+/** Allowlist callback to check if a given player is allowed to join. PlayerUUID is lowercase. */
+type AllowListCallback = (username: string, playerUUID: string) => boolean
 
 export interface ProxyOptions {
   port?: number
   motd?: string
+  /** 
+   * Version to use. 
+   * @default 1.19.4
+   */
+  version?: '1.12.2' | '1.19.4'
+  /**
+   * Spawn a fake player when not in control.
+   * @default true
+   */
+  spawnFakePlayer?: boolean
   security?: {
     onlineMode?: boolean
     /** Optional. If not set all players are allowed to join. Either a list off players allowed to connect to the proxy or a function that returns a boolean value. */
-    allowList?: string[] | allowListCallback
+    allowList?: string[] | AllowListCallback
     kickMessage?: string
   },
   /** Link a connecting client as soon as he joins if no one else is currently controlling the proxy. Default: true */
@@ -55,6 +68,10 @@ export interface ProxyOptions {
   worldCaching?: boolean
 
   positionOffset?: Vec3
+
+  baseCenter?: Vec3
+  baseHalfLength?: number
+  restrictMessage?: string
 }
 
 declare module 'mineflayer' {
@@ -107,6 +124,8 @@ export class InspectorProxy extends EventEmitter {
     super()
     this.proxyOptions = proxyOptions
     this.server = undefined
+    this.proxyOptions.version ??= '1.19.4'
+    this.proxyOptions.spawnFakePlayer = proxyOptions.spawnFakePlayer ?? true
     this.blockedPacketsWhenNotInControl = ['abilities', 'position']
 
     this.proxyOptions.botAutoStart ??= true
@@ -135,6 +154,8 @@ export class InspectorProxy extends EventEmitter {
       }
     }
 
+    this.proxyOptions.baseHalfLength ??= 1000
+
     this.options = {
       ...options,
       // @ts-ignore
@@ -149,13 +170,13 @@ export class InspectorProxy extends EventEmitter {
     }
   }
 
-  playerInWhitelist(name: string): boolean {
+  playerInWhitelist(name: string, uuid: string): boolean {
     if (!this.proxyOptions.security?.allowList) return true
     if (typeof this.proxyOptions.security.allowList === 'object') {
       return this.proxyOptions.security?.allowList?.find(n => n.toLowerCase() === name.toLowerCase()) !== undefined
     } else if (typeof this.proxyOptions.security.allowList === 'function') {
       try {
-        return !!this.proxyOptions.security.allowList(name)
+        return !!this.proxyOptions.security.allowList(name, uuid.toLowerCase())
       } catch (e) {
         console.warn('allowlist callback had error', e)
         return false
@@ -186,7 +207,10 @@ export class InspectorProxy extends EventEmitter {
     if (this.proxyOptions.positionOffset) {
       offset = this.proxyOptions.positionOffset
     }
-    const conn = new Conn(this.options, {
+    const conn = new Conn({
+      ...this.options,
+      version: this.proxyOptions.version ?? '1.19.4',
+    }, {
       toClientMiddleware: [...this.genToClientMiddleware(), ...(this.proxyOptions.toClientMiddlewares || [])],
       toServerMiddleware: [...this.genToServerMiddleware(), ...(this.proxyOptions.toServerMiddlewares || [])],
       positionTransformer: offset
@@ -217,6 +241,8 @@ export class InspectorProxy extends EventEmitter {
       return
     }
     this.fakePlayer?.destroy()
+    this.fakePlayer = undefined
+    this.fakeSpectator = undefined
     if (this.proxyOptions.disconnectAllOnEnd) {
         this.conn.pclients.forEach((c) => {
         c.end(message)
@@ -257,7 +283,7 @@ export class InspectorProxy extends EventEmitter {
       motd: motd,
       'online-mode': this.proxyOptions.security?.onlineMode ?? false,
       port: this.proxyOptions.port ?? 25566,
-      version: '1.12.2',
+      version: this.proxyOptions.version ?? '1.19.4',
       hideErrors: true
     })
 
@@ -376,12 +402,14 @@ export class InspectorProxy extends EventEmitter {
 
     this.conn.bot.once('login', () => {
       if (!this.conn) return
-      this.fakePlayer = new FakePlayer(this.conn.stateData.bot, {
-        username: this.conn.bot.username,
-        uuid: this.conn.bot._client.uuid,
-        positionTransformer: this.conn.positionTransformer
-      })
-      this.fakeSpectator = new FakeSpectator(this.conn.bot, { positionTransformer: this.conn.positionTransformer })
+      if (this.proxyOptions.spawnFakePlayer) {
+        this.fakePlayer = new FakePlayer(this.conn.stateData.bot, {
+          username: this.conn.bot.username,
+          uuid: this.conn.bot._client.uuid,
+          positionTransformer: this.conn.positionTransformer
+        })
+        this.fakeSpectator = new FakeSpectator(this.conn.bot, { positionTransformer: this.conn.positionTransformer })
+      }
       if (this.proxyOptions.serverAutoStart) {
         if (!this.server) this.startServer()
       }
@@ -407,7 +435,7 @@ export class InspectorProxy extends EventEmitter {
   }
 
   private async onClientLogin(client: ServerClient) {
-    if (!this.playerInWhitelist(client.username)) {
+    if (!this.playerInWhitelist(client.username, client.uuid)) {
       const { address, family, port } = {
         address: 'unknown',
         family: 'unknown',
@@ -509,8 +537,9 @@ export class InspectorProxy extends EventEmitter {
     const inspector_toServerMiddleware: PacketMiddleware = ({ meta, pclient, data, isCanceled }) => {
       if (!this.conn || !pclient) return
       let returnValue: false | undefined = undefined
-      if (meta.name === 'chat' && !this.proxyOptions.disabledCommands) {
+      if (meta.name === 'chat_message' && !this.proxyOptions.disabledCommands) {
         this.emit('clientChatRaw', pclient, data.message)
+        console.info('Chat message', data.message)
         let isCommand = false
         if ((data.message as string).startsWith('$')) { // command
           returnValue = false // Cancel everything that starts with $
@@ -575,8 +604,6 @@ export class InspectorProxy extends EventEmitter {
         }
         return data
       } else if (meta.name === 'use_entity') {
-        return
-      } else if (meta.name === 'use_entity') {
         if (this.fakeSpectator?.clientsInCamera[pclient.uuid] && this.fakeSpectator?.clientsInCamera[pclient.uuid].status) {
           if (data.mouse === 0 || data.mouse === 1) {
             this.fakeSpectator.revertPov(pclient)
@@ -584,6 +611,56 @@ export class InspectorProxy extends EventEmitter {
           }
         }
       }
+
+      if (meta.name === 'position' && this.proxyOptions.baseCenter && this.proxyOptions.baseHalfLength && (meta.name === 'position' || meta.name === 'position_look')) {
+        // console.log('outside of base')
+        if (!this.conn?.bot) return
+
+        const center = this.proxyOptions.baseCenter
+        const halfLength = this.proxyOptions.baseHalfLength
+
+        // Extract player's new position
+        const playerPos = new Vec3(
+          data.x,
+          data.y,
+          data.z
+        )
+
+        // Check if player is outside the base area
+        const isOutsideX = Math.abs(playerPos.x - center.x) > halfLength
+        const isOutsideZ = Math.abs(playerPos.z - center.z) > halfLength
+
+        if (isOutsideX || isOutsideZ) {
+          // Revert to last known good position (typically the bot's position)
+          if (this.conn.bot.entity) {
+            const safePosition = this.conn.bot.entity.position
+
+            // Send a teleport packet to bring the player back
+            const teleportPacket = {
+              x: safePosition.x,
+              y: safePosition.y,
+              z: safePosition.z,
+              yaw: data.yaw || 0,
+              pitch: data.pitch || 0,
+              flags: 0x00, // absolute coordinates
+              teleportId: 1 // arbitrary teleport ID
+            }
+
+            // Custom message explaining the restriction
+            const restrictionMessage = `§cYou cannot leave the base area!`
+            
+            // Send custom message to the client
+            this.message(pclient, restrictionMessage)
+
+            // Depending on the packet type, adjust the teleport packet
+            pclient.write('position', teleportPacket)
+
+            // Cancel the original movement packet
+            return false
+          }
+        }
+      }
+      
       return returnValue
     }
 
