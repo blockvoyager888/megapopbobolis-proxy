@@ -4,13 +4,13 @@ const { Vec3 } = require('vec3')
 
 // Configuration
 const SERVER_CONFIG = {
-  host: 'minehut.gg',
+  host: 'evbopkserver.minehut.gg',
   auth: 'microsoft', //change later
 }
 
 const BASE_CONFIG = {
-  baseCenter: new Vec3(1000, 0, 10000),
-  baseHalfLength: 5
+  baseCenter: new Vec3(-10, 63, -28),
+  baseHalfLength: 50
 }
 
 const proxy = new InspectorProxy({
@@ -19,18 +19,18 @@ const proxy = new InspectorProxy({
   password: process.env.PASSWORD,
   auth: SERVER_CONFIG.auth,
   profilesFolder: './nmp-cache',
-  version: '1.19.4',
+  version: '1.12.2',
   checkTimeoutInterval: 90_000,
 }, {
   linkOnConnect: true,
-  // version: '1.19.4',
+  version: '1.12.2',
   botAutoStart: false,
   botStopOnLogoff: true,
   serverAutoStart: true,
   serverStopOnBotStop: false,
   autoStartBotOnServerLogin: true,
-  worldCaching: false,
-//   positionOffset: new Vec3(10, 0, 0),
+  worldCaching: true,
+  positionOffset: new Vec3(1, 0, 0),
   baseCenter: BASE_CONFIG.baseCenter,
   baseHalfLength: BASE_CONFIG.baseHalfLength
 })

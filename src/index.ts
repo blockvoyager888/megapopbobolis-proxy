@@ -1,4 +1,4 @@
-import { Client, Conn, PacketMiddleware, packetAbilities, sendTo, SimplePositionTransformer } from "@icetank/mcproxy";
+import { Client, Conn, PacketMiddleware, packetAbilities, sendTo, SimplePositionTransformer, Packet } from "@icetank/mcproxy";
 import { createServer, ServerClient } from "minecraft-protocol";
 import type { Server } from "minecraft-protocol";
 import { sendMessage, sleep, onceWithCleanup } from "./util";
@@ -155,6 +155,7 @@ export class InspectorProxy extends EventEmitter {
     }
 
     this.proxyOptions.baseHalfLength ??= 1000
+    this.proxyOptions.baseCenter ??= new Vec3(0, 0, 0)
 
     this.options = {
       ...options,
@@ -535,8 +536,11 @@ export class InspectorProxy extends EventEmitter {
 
   private genToServerMiddleware() {
     const inspector_toServerMiddleware: PacketMiddleware = ({ meta, pclient, data, isCanceled }) => {
+      console.log(meta.name)
       if (!this.conn || !pclient) return
       let returnValue: false | undefined = undefined
+      console.log(meta.name);
+      if (pclient !== null) this.message(pclient, meta.name)
       if (meta.name === 'chat_message' && !this.proxyOptions.disabledCommands) {
         this.emit('clientChatRaw', pclient, data.message)
         console.info('Chat message', data.message)
@@ -659,6 +663,23 @@ export class InspectorProxy extends EventEmitter {
             return false
           }
         }
+        return data;
+      }
+
+      if (meta.name === 'block_place') {
+        console.log('placing')
+        if (data.location && this.conn?.bot?.world) {
+          const block = this.conn.bot.world.getBlock(data.location);
+          if (block && block.type === 46) {
+            return false;
+          }
+        }
+      }
+
+      if (meta.name === 'use_item') {
+        if (data.item?.blockId === 46) {
+          return false;
+        }
       }
       
       return returnValue
@@ -668,10 +689,16 @@ export class InspectorProxy extends EventEmitter {
   }
 
   private genToClientMiddleware() {
-    const inspector_toClientMiddleware: PacketMiddleware = ({ meta, isCanceled, bound }) => {
+
+    const TNT_BLOCK_ID = 46; 
+    const TNT_ITEM_ID = 46; 
+
+    const inspector_toClientMiddleware: PacketMiddleware = ({ meta, pclient, isCanceled, bound }) => {
+      console.log(meta.name)
       if (!this.conn) return
       if (isCanceled) return
       if (bound !== 'client') return
+      console.log(meta.name)
       if (this.botIsInControl()) {
         if (this.blockedPacketsWhenNotInControl.includes(meta.name)) return false
       }
@@ -703,7 +730,177 @@ export class InspectorProxy extends EventEmitter {
       }
     }
 
-    return [inspector_toClientMiddleware, inspector_toClientFakePlayerSync, inspector_toClientMiddlewareRecipesFix]
+    const inspector_toClientBaseRegion: PacketMiddleware = ({ meta, data, bound }) => {
+      if (!this.conn?.bot || bound !== 'client') return;
+      if (meta.name !== 'map_chunk') return;
+      
+      if (!this.proxyOptions.baseCenter || !this.proxyOptions.baseHalfLength) return;
+      console.log('getting chunks')
+      const center = this.proxyOptions.baseCenter;
+      const halfLength = this.proxyOptions.baseHalfLength;
+
+      // Calculate chunk coordinates from the data
+      const chunkX = data.x;
+      const chunkZ = data.z;
+
+      // Convert chunk coordinates to block coordinates (multiply by 16 since chunks are 16x16)
+      const blockX = chunkX * 16;
+      const blockZ = chunkZ * 16;
+
+      // Check if the chunk is outside the base region
+      const isOutsideX = Math.abs(blockX - center.x) > halfLength;
+      const isOutsideZ = Math.abs(blockZ - center.z) > halfLength;
+
+      // If the chunk is outside the allowed region, cancel the packet
+      if (isOutsideX || isOutsideZ) {
+        const voidChunk = {
+          ...data,
+          sections: [], // Empty sections array
+          biomes: new Int8Array(1024).fill(1), // Fill with a default biome
+          blockEntities: [], // No block entities
+          heightmaps: {
+            MOTION_BLOCKING: new Int8Array(256).fill(0),
+            WORLD_SURFACE: new Int8Array(256).fill(0)
+          }
+        };
+        
+        return voidChunk;
+      }
+
+      return data;
+    }
+
+    const inspector_toClientBannedItems: PacketMiddleware = ({ meta, data, bound }) => {
+      if (!this.conn) return
+      if (bound !== 'client') return
+      console.log(meta.name)
+      if (meta.name === 'block_update') {
+        console.log('block update')
+        if (data.type === TNT_BLOCK_ID) {
+          return {
+            ...data,
+            type: 0  // Replace with air
+          };
+        }
+      }
+  
+      // Replace TNT in multi-block changes
+      if (meta.name === 'multi_block_change') {
+        if (data.records) {
+          data.records = data.records.map((record: any) => {
+            if (record.blockId === TNT_BLOCK_ID) {
+              return { ...record, blockId: 0 };  // Replace with air
+            }
+            return record;
+          });
+        }
+      }
+  
+      // Remove TNT from inventory
+      if (meta.name === 'set_slot') {
+        if (data.item?.blockId === TNT_ITEM_ID) {
+          data.item = null;  // Remove the TNT item
+          return data;
+        }
+      }
+  
+      // Remove TNT from window items
+      if (meta.name === 'window_items') {
+        if (data.items) {
+          data.items = data.items.map((item: any) => {
+            if (item?.blockId === TNT_ITEM_ID) {
+              return null;  // Remove the TNT item
+            }
+            return item;
+          });
+        }
+      }
+      if (meta.name === 'block_update') {
+        console.log('block update')
+        if (data.type === 46) { // TNT block ID
+          return {
+            ...data,
+            type: 0 // Replace with air
+          };
+        }
+      }
+
+      if (meta.name === 'multi_block_change') {
+        console.log('multi block change')
+        if (data.records) {
+          data.records = data.records.map((record: any) => {
+            if (record.blockId === 46) { // TNT block ID
+              return { ...record, blockId: 0 }; // Replace with air
+            }
+            return record;
+          });
+        }
+      }
+
+      return data;
+    }
+
+    const inspector_toClientCoordinateTransform: PacketMiddleware = ({ meta, data, bound }) => {
+      if (!this.conn?.bot || bound !== 'client') return;
+    
+      if (!this.proxyOptions.baseCenter) return;
+    
+      const baseCenterX = this.proxyOptions.baseCenter?.x ?? 0;
+      const baseCenterZ = this.proxyOptions.baseCenter?.z ?? 0;
+    
+      // Handle position packets
+      if (meta.name === 'position' || meta.name === 'position_look') {
+        return {
+          ...data,
+          x: data.x - baseCenterX,
+          z: data.z - baseCenterZ,
+        };
+      }
+    
+      // Handle player_info packets (used by F3 debug screen)
+      if (meta.name === 'player_info') {
+        if (data.data) {
+          data.data = data.data.map((playerData: any) => {
+            if (playerData.position) {
+              const playerX = playerData.position?.x ?? 0;
+              const playerZ = playerData.position?.z ?? 0;
+              return {
+                ...playerData,
+                position: {
+                  x: playerX - baseCenterX,
+                  y: playerData.position.y,
+                  z: playerZ - baseCenterZ,
+                },
+              };
+            }
+            return playerData;
+          });
+        }
+        return data;
+      }
+    
+      // Handle entity position packets
+      if (meta.name === 'entity_teleport') {
+        return {
+          ...data,
+          x: data.x - baseCenterX,
+          z: data.z - baseCenterZ,
+        };
+      }
+    
+      if (meta.name === 'spawn_position') {
+        return {
+          ...data,
+          x: data.x - baseCenterX,
+          z: data.z - baseCenterZ,
+        };
+      }
+    
+      return data;
+    };
+    
+
+    return [inspector_toClientMiddleware, inspector_toClientFakePlayerSync, inspector_toClientMiddlewareRecipesFix, inspector_toClientBaseRegion, inspector_toClientBannedItems]
   }
 
   setMotd(line1: string, line2: string = "") {
